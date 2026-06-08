@@ -1,265 +1,199 @@
-#!/bin/bash
-# ============================================================
-# perfmax.sh — Debian 13 "Trixie" Maximum Performance Tuner
-# Applies system-wide: every user on the machine benefits.
-# Persists across reboots via systemd unit.
-# Auto-reboots at the end (15s grace window).
-# ============================================================
+#!/usr/bin/env bash
+#
+# ultra-optimize.sh — high-performance tuning for Debian 13 (Trixie, kernel 6.12 LTS)
+# Target: dedicated / single-tenant servers doing heavy CPU + many-process/thread work.
+#
+# Design rules baked in:
+#   * NO net.* sysctls anywhere in the persistent config (they can break accops-client
+#     Roblox API connectivity). Network tuning lives in a SEPARATE, opt-in step.
+#   * sysctl drop-in is prefixed 98- so it loads BEFORE 99-accops-memory.conf and lets
+#     AccountOps win on any key it owns.
+#   * Everything is idempotent and reversible. Originals are backed up to /root/perf-backup-<ts>.
+#
+# Usage:
+#   sudo bash ultra-optimize.sh                 # apply the safe, default profile
+#   sudo bash ultra-optimize.sh --aggressive    # also disables CPU mitigations (REBOOT, security tradeoff)
+#   sudo bash ultra-optimize.sh --revert        # restore from the most recent backup
+#
 set -euo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root:  sudo bash $0"
-  exit 1
+AGGRESSIVE=0
+REVERT=0
+for arg in "$@"; do
+  case "$arg" in
+    --aggressive) AGGRESSIVE=1 ;;
+    --revert)     REVERT=1 ;;
+    *) echo "unknown flag: $arg"; exit 1 ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Run as root (sudo)."; exit 1; }
+
+TS="$(date +%Y%m%d-%H%M%S)"
+BACKUP="/root/perf-backup-${TS}"
+log(){ printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# REVERT
+# ---------------------------------------------------------------------------
+if [[ $REVERT -eq 1 ]]; then
+  last="$(ls -d /root/perf-backup-* 2>/dev/null | sort | tail -n1 || true)"
+  [[ -n "$last" ]] || { echo "No backup found."; exit 1; }
+  warn "Reverting using $last"
+  rm -f /etc/sysctl.d/98-performance.conf
+  rm -f /etc/udev/rules.d/60-ioschedulers.rules
+  rm -f /etc/systemd/system/perf-tunables.service
+  rm -f /etc/systemd/system.conf.d/99-perf-limits.conf
+  rm -f /etc/security/limits.d/99-perf.conf
+  systemctl daemon-reload
+  systemctl disable --now perf-tunables.service 2>/dev/null || true
+  [[ -f "$last/sysctl.conf" ]] && cp "$last/sysctl.conf" /etc/sysctl.conf
+  sysctl --system >/dev/null
+  log "Reverted. A reboot is recommended to fully restore governor/THP/limits."
+  exit 0
 fi
 
-LOG=/var/log/perfmax.log
-exec > >(tee -a "$LOG") 2>&1
-echo
-echo "================ PerfMax started: $(date) ================"
+mkdir -p "$BACKUP"
+[[ -f /etc/sysctl.conf ]] && cp /etc/sysctl.conf "$BACKUP/sysctl.conf"
+log "Backup dir: $BACKUP"
 
-# ------------------------------------------------------------
-# 1) Install the userspace tools we need
-# ------------------------------------------------------------
-echo "[1/16] Installing tooling..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends \
-    linux-cpupower \
-    cpufrequtils \
-    irqbalance \
-    power-profiles-daemon \
-    sysfsutils \
-    util-linux \
-    ethtool \
-    systemd-zram-generator || true
+# ===========================================================================
+# 1. sysctl — memory, VM, process/thread scaling, fs handles  (NO net.*)
+# ===========================================================================
+log "Writing /etc/sysctl.d/98-performance.conf"
+cat > /etc/sysctl.d/98-performance.conf <<'EOF'
+# High-performance tuning — Debian 13 / kernel 6.12 (EEVDF scheduler).
+# Prefix 98- loads BEFORE 99-accops-memory.conf so AccountOps keeps the last word.
+# Intentionally contains NO net.* keys — those can break accops-client connectivity.
 
-# ------------------------------------------------------------
-# 2) Bring every CPU online (no offline cores)
-# ------------------------------------------------------------
-echo "[2/16] Bringing all CPU cores online..."
-for c in /sys/devices/system/cpu/cpu[0-9]*/online; do
-    echo 1 > "$c" 2>/dev/null || true
-done
+# --- Virtual memory / writeback ---
+vm.swappiness = 10                 # keep working set in RAM; don't swap eagerly
+vm.vfs_cache_pressure = 50         # retain dentry/inode cache longer
+vm.dirty_ratio = 15                # cap dirty pages before forced writeback
+vm.dirty_background_ratio = 5      # start async writeback early to avoid stalls
+vm.dirty_expire_centisecs = 1500
+vm.dirty_writeback_centisecs = 1500
+vm.min_free_kbytes = 131072        # 128MB emergency reserve (raise to ~1% of RAM on big boxes)
+vm.max_map_count = 1048576         # lots of headroom for many threads/mmaps
 
-# ------------------------------------------------------------
-# 3) CPU governor -> performance on every core
-# ------------------------------------------------------------
-echo "[3/16] Setting governor=performance on all cores..."
-for g in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
-    echo performance > "$g" 2>/dev/null || true
-done
+# --- Process / thread / file-handle scaling ---
+kernel.pid_max = 4194304
+kernel.threads-max = 4194304
+fs.file-max = 12000000             # huge global FD ceiling
+fs.nr_open = 2147483584            # per-process hard FD ceiling (max allowed)
+fs.aio-max-nr = 1048576            # async I/O requests
+fs.inotify.max_user_watches = 1048576
+fs.inotify.max_user_instances = 8192
 
-# ------------------------------------------------------------
-# 4) Pin min freq = max freq so cores never downclock
-# ------------------------------------------------------------
-echo "[4/16] Pinning min freq = max freq..."
-for c in /sys/devices/system/cpu/cpu[0-9]*; do
-    if [[ -f "$c/cpufreq/cpuinfo_max_freq" ]]; then
-        MAX=$(cat "$c/cpufreq/cpuinfo_max_freq")
-        echo "$MAX" > "$c/cpufreq/scaling_max_freq" 2>/dev/null || true
-        echo "$MAX" > "$c/cpufreq/scaling_min_freq" 2>/dev/null || true
-    fi
-done
+# --- Scheduler behaviour (valid on EEVDF / 6.12) ---
+kernel.sched_autogroup_enabled = 0 # better for server batch workloads than desktop autogrouping
 
-# ------------------------------------------------------------
-# 5) Enable Turbo Boost / AMD boost
-# ------------------------------------------------------------
-echo "[5/16] Enabling Turbo / Boost..."
-[[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]] && \
-    echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo
-[[ -f /sys/devices/system/cpu/cpufreq/boost ]] && \
-    echo 1 > /sys/devices/system/cpu/cpufreq/boost
-[[ -f /sys/devices/system/cpu/amd_pstate/status ]] && \
-    echo active > /sys/devices/system/cpu/amd_pstate/status 2>/dev/null || true
-
-# ------------------------------------------------------------
-# 6) Energy Performance Preference -> performance
-# ------------------------------------------------------------
-echo "[6/16] EPP -> performance..."
-for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
-    [[ -w "$f" ]] && echo performance > "$f" 2>/dev/null || true
-done
-
-# ------------------------------------------------------------
-# 7) power-profiles-daemon -> performance
-# ------------------------------------------------------------
-echo "[7/16] power-profiles-daemon -> performance..."
-if command -v powerprofilesctl >/dev/null 2>&1; then
-    systemctl enable --now power-profiles-daemon || true
-    powerprofilesctl set performance || true
-fi
-
-# ------------------------------------------------------------
-# 8) Persist everything via a systemd unit
-# ------------------------------------------------------------
-echo "[8/16] Installing systemd persistence unit..."
-cat > /usr/local/sbin/perfmax-apply.sh <<'EOF'
-#!/bin/bash
-# Re-applies max-performance settings on each boot
-for c in /sys/devices/system/cpu/cpu[0-9]*/online; do
-    echo 1 > "$c" 2>/dev/null || true
-done
-for g in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
-    echo performance > "$g" 2>/dev/null || true
-done
-for c in /sys/devices/system/cpu/cpu[0-9]*; do
-    if [[ -f "$c/cpufreq/cpuinfo_max_freq" ]]; then
-        MAX=$(cat "$c/cpufreq/cpuinfo_max_freq")
-        echo "$MAX" > "$c/cpufreq/scaling_max_freq" 2>/dev/null || true
-        echo "$MAX" > "$c/cpufreq/scaling_min_freq" 2>/dev/null || true
-    fi
-done
-[[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]] && \
-    echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo
-[[ -f /sys/devices/system/cpu/cpufreq/boost ]] && \
-    echo 1 > /sys/devices/system/cpu/cpufreq/boost
-for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
-    [[ -w "$f" ]] && echo performance > "$f" 2>/dev/null || true
-done
-command -v powerprofilesctl >/dev/null 2>&1 && \
-    powerprofilesctl set performance >/dev/null 2>&1 || true
-exit 0
+# --- Optional, test before keeping ---
+# vm.overcommit_memory = 1         # avoids fork/alloc failures, but raises OOM-kill risk
+# kernel.numa_balancing = 0        # only meaningful on multi-socket hosts
 EOF
-chmod +x /usr/local/sbin/perfmax-apply.sh
 
-cat > /etc/systemd/system/perfmax.service <<'EOF'
+# ===========================================================================
+# 2. ulimits — PAM logins AND systemd services (services ignore limits.conf!)
+# ===========================================================================
+log "Raising file-descriptor / process limits"
+cat > /etc/security/limits.d/99-perf.conf <<'EOF'
+*    soft  nofile  1048576
+*    hard  nofile  1048576
+*    soft  nproc   1048576
+*    hard  nproc   1048576
+root soft  nofile  1048576
+root hard  nofile  1048576
+EOF
+
+# systemd-managed daemons (accops-client, farmsync, etc.) do NOT read limits.conf,
+# so set the systemd-wide defaults too:
+mkdir -p /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/99-perf-limits.conf <<'EOF'
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=1048576
+EOF
+systemctl daemon-reexec || true
+
+# ===========================================================================
+# 3. I/O scheduler — persistent via udev (none for NVMe, mq-deadline for SSD/HDD)
+# ===========================================================================
+log "Installing persistent I/O scheduler udev rule"
+cat > /etc/udev/rules.d/60-ioschedulers.rules <<'EOF'
+# NVMe: bypass the scheduler entirely (lowest latency, highest IOPS)
+ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none"
+# SATA/virtio SSD & HDD: mq-deadline is the balanced default
+ACTION=="add|change", KERNEL=="sd[a-z]|vd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
+ACTION=="add|change", KERNEL=="sd[a-z]|vd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+EOF
+udevadm control --reload-rules && udevadm trigger || true
+
+# ===========================================================================
+# 4. CPU governor + THP — persistent via a oneshot systemd service
+#    (governor & THP reset on reboot otherwise; VPS guests may lack cpufreq — handled)
+# ===========================================================================
+log "Installing perf-tunables.service (governor + THP at boot)"
+cat > /usr/local/sbin/perf-tunables.sh <<'EOF'
+#!/usr/bin/env bash
+# Set CPU governor to performance where cpufreq is exposed
+if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
+  for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [[ -w "$g" ]] && echo performance > "$g" 2>/dev/null || true
+  done
+fi
+# Transparent Huge Pages: 'madvise' = throughput gains without the worst latency spikes.
+# Flip to 'always' for pure batch throughput, or 'never' if a DB recommends it.
+for f in /sys/kernel/mm/transparent_hugepage/enabled \
+         /sys/kernel/mm/transparent_hugepage/defrag; do
+  [[ -w "$f" ]] && echo madvise > "$f" 2>/dev/null || true
+done
+EOF
+chmod +x /usr/local/sbin/perf-tunables.sh
+
+cat > /etc/systemd/system/perf-tunables.service <<'EOF'
 [Unit]
-Description=PerfMax — re-apply max performance settings at boot
+Description=High-performance CPU governor + THP tunables
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/perfmax-apply.sh
+ExecStart=/usr/local/sbin/perf-tunables.sh
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable perfmax.service
+systemctl enable --now perf-tunables.service || true
 
-# ------------------------------------------------------------
-# 9) Kernel / sysctl tuning
-# ------------------------------------------------------------
-echo "[9/16] Applying sysctl tuning..."
-cat > /etc/sysctl.d/99-perfmax.conf <<'EOF'
-# --- Memory / VM ---
-vm.swappiness=10
-vm.vfs_cache_pressure=50
-vm.dirty_ratio=10
-vm.dirty_background_ratio=5
-vm.max_map_count=1048576
-
-# --- Network throughput (BBR + fq) ---
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.core.rmem_max=134217728
-net.core.wmem_max=134217728
-net.ipv4.tcp_rmem=4096 87380 67108864
-net.ipv4.tcp_wmem=4096 65536 67108864
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
-net.core.netdev_max_backlog=16384
-net.core.somaxconn=8192
-
-# --- Filesystem / inotify (helps emulators & dev tools) ---
-fs.file-max=2097152
-fs.inotify.max_user_watches=524288
-fs.inotify.max_user_instances=8192
-
-# --- Scheduler (Debian 13 EEVDF) ---
-kernel.sched_autogroup_enabled=1
-EOF
+# ===========================================================================
+# 5. Apply sysctl now
+# ===========================================================================
+log "Applying sysctl"
 sysctl --system >/dev/null
 
-# ------------------------------------------------------------
-# 10) Optimal I/O schedulers (auto per device type)
-# ------------------------------------------------------------
-echo "[10/16] Installing I/O scheduler udev rule..."
-cat > /etc/udev/rules.d/60-ioschedulers.rules <<'EOF'
-# NVMe -> none (no overhead)
-ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none"
-# SATA SSD -> mq-deadline (low latency, TRIM-aware)
-ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
-# HDD -> bfq (fair, interactive-friendly)
-ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
-EOF
-udevadm control --reload
-udevadm trigger || true
-
-# ------------------------------------------------------------
-# 11) IRQ balancing across all cores
-# ------------------------------------------------------------
-echo "[11/16] Enabling irqbalance..."
-systemctl enable --now irqbalance || true
-
-# ------------------------------------------------------------
-# 12) Disable sleep / suspend / hibernate
-# ------------------------------------------------------------
-echo "[12/16] Masking sleep targets..."
-systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target || true
-
-# ------------------------------------------------------------
-# 13) ZRAM compressed swap (RAM-backed, ~3-5x faster than disk swap)
-# ------------------------------------------------------------
-echo "[13/16] Configuring ZRAM..."
-mkdir -p /etc/systemd
-cat > /etc/systemd/zram-generator.conf <<'EOF'
-[zram0]
-zram-size = ram / 2
-compression-algorithm = zstd
-swap-priority = 100
-EOF
-systemctl daemon-reload || true
-systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
-
-# ------------------------------------------------------------
-# 14) Raise resource limits for ALL users
-# ------------------------------------------------------------
-echo "[14/16] Raising limits for all users..."
-cat > /etc/security/limits.d/99-perfmax.conf <<'EOF'
-* soft nofile 1048576
-* hard nofile 1048576
-* soft nproc  unlimited
-* hard nproc  unlimited
-root soft nofile 1048576
-root hard nofile 1048576
-EOF
-# systemd-managed services
-mkdir -p /etc/systemd/system.conf.d
-cat > /etc/systemd/system.conf.d/99-perfmax.conf <<'EOF'
-[Manager]
-DefaultLimitNOFILE=1048576
-DefaultLimitNPROC=unlimited
-EOF
-
-# ------------------------------------------------------------
-# 15) Weekly TRIM
-# ------------------------------------------------------------
-echo "[15/16] Enabling weekly fstrim..."
-systemctl enable --now fstrim.timer || true
-
-# ------------------------------------------------------------
-# 16) Verification report
-# ------------------------------------------------------------
-echo
-echo "================ VERIFICATION ================"
-echo "Cores online: $(nproc) of $(getconf _NPROCESSORS_CONF)"
-echo "Governors in use:"
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u | sed 's/^/  - /'
-[[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]] && \
-    echo "intel no_turbo : $(cat /sys/devices/system/cpu/intel_pstate/no_turbo)  (0 = turbo ON)"
-[[ -f /sys/devices/system/cpu/cpufreq/boost ]] && \
-    echo "cpufreq boost  : $(cat /sys/devices/system/cpu/cpufreq/boost)  (1 = ON)"
-if command -v powerprofilesctl >/dev/null 2>&1; then
-    echo "PPD profile    : $(powerprofilesctl get)"
+# ===========================================================================
+# 6. (--aggressive) Disable CPU mitigations — biggest single CPU win, security tradeoff
+# ===========================================================================
+if [[ $AGGRESSIVE -eq 1 ]]; then
+  warn "AGGRESSIVE: disabling CPU mitigations in GRUB (Spectre/Meltdown/etc.)."
+  warn "Only do this on a TRUSTED, single-tenant box. Requires reboot."
+  cp /etc/default/grub "$BACKUP/grub"
+  if ! grep -q 'mitigations=off' /etc/default/grub; then
+    sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 mitigations=off"/' /etc/default/grub
+    update-grub
+    warn "GRUB updated. Reboot to take effect."
+  fi
 fi
-echo "TCP congestion : $(sysctl -n net.ipv4.tcp_congestion_control)"
-echo "Default qdisc  : $(sysctl -n net.core.default_qdisc)"
-echo "Swappiness     : $(sysctl -n vm.swappiness)"
-echo "==============================================="
-echo "Log saved to: $LOG"
+
 echo
-echo "Rebooting in 15 seconds. Press Ctrl+C to cancel."
-sleep 15
-systemctl reboot
+log "Done. Summary:"
+echo "    governor : $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'n/a (no cpufreq — typical on VPS)')"
+echo "    THP      : $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo n/a)"
+echo "    swappiness=$(sysctl -n vm.swappiness)  max_map_count=$(sysctl -n vm.max_map_count)  pid_max=$(sysctl -n kernel.pid_max)"
+echo "    file-max : $(sysctl -n fs.file-max)"
+echo
+warn "fstab not touched. For SSD/NVMe add 'noatime' to your data mounts manually for a free I/O win."
+warn "Revert anytime with: sudo bash ultra-optimize.sh --revert"
